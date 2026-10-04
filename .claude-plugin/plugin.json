@@ -1,0 +1,15 @@
+{
+  "name": "native-hud",
+  "version": "0.1.0",
+  "description": "输入框下方的原生 HUD：模型、路径、git/worktree、上下文、5h/7d 用量与重置倒计时、输出速度、缓存命中率",
+  "author": {
+    "name": "Luban Labs"
+  },
+  "keywords": [
+    "statusline",
+    "hud",
+    "mod",
+    "prompt-hint"
+  ],
+  "types": "./types/index.d.ts"
+}
