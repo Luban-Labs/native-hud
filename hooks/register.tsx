@@ -117,7 +117,57 @@ export function toUsage(context: SessionContextUsage, limits: readonly SessionRa
   }
 }
 
+// The desktop's one plain-text line, most wanted first: no model or path (the
+// desktop's footer and sidebar show them), no 7d (its usage view has it), 5h only
+// on an account that has that limit, git only inside a repository.
+export function statusText(u: HudUsage, s: HudSpeed, c: HudCache, g: HudGit | null, clock: number): string {
+  const segs: string[] = []
+  const five = u.fiveHour
+  if (five !== null) {
+    const reset = five.resetsAt !== null ? ` ↻${fmtDur(five.resetsAt - clock)}` : ''
+    segs.push(`5h ${Math.round(five.percent)}%${reset}`)
+  }
+  segs.push(u.ctxPercent === null ? 'ctx —' : `ctx ${u.ctxPercent}%`)
+  segs.push(
+    s.live !== null
+      ? `⚡ ~${Math.round(s.live)} tok/s`
+      : s.last !== null
+        ? `⚡ ${Math.round(s.last)} tok/s`
+        : '⚡ — tok/s',
+  )
+  segs.push(c.last === null ? 'cache —' : `cache ${Math.round(c.last)}%`)
+  if (g !== null) {
+    const parts = [`⎇ ${g.branch}`]
+    if (g.worktree !== null) parts.push(`wt:${g.worktree}`)
+    parts.push(g.dirty > 0 ? `●${g.dirty}` : '✓')
+    if (g.ahead > 0) parts.push(`↑${g.ahead}`)
+    if (g.behind > 0) parts.push(`↓${g.behind}`)
+    segs.push(parts.join(' '))
+  }
+  return segs.join(' · ')
+}
+
 // ---------- data refresh ----------
+
+// A local desktop session never asks for PromptHint, so on the desktop the HUD is
+// this plugin's status line, synced after every HUD write and roster change (update
+// takes the atom itself at its call site, so each write is followed by its own
+// sync). A terminal draws the PromptHint rows already, so no status line wherever
+// one draws. The text last pushed; null until session.start pushes, so each start
+// pushes once, a clear included.
+let shownStatus: string | undefined | null = null
+
+async function syncStatus($: EngineInterface): Promise<void> {
+  const surfaces = await $.session.surfaces()
+  const [i, u, s, c, t] = await Promise.all([read($, info), read($, usage), read($, speed), read($, cache), read($, now)])
+  const text =
+    surfaces.includes('desktop') && !surfaces.includes('terminal') && i.model !== ''
+      ? statusText(u, s, c, i.git, t || Date.now())
+      : undefined
+  if (text === shownStatus) return
+  shownStatus = text
+  $.ui.status(text)
+}
 
 async function readGit($: EngineInterface, cwd: string): Promise<HudGit | null> {
   try {
@@ -151,10 +201,12 @@ async function refreshUsage($: EngineInterface): Promise<void> {
 async function settleStep($: EngineInterface, u: TurnUsage | null, ms: number): Promise<void> {
   const out = u?.output_tokens ?? 0
   await update($, speed, s => (ms >= 250 && out > 0 ? { last: out / (ms / 1000), live: null } : { ...s, live: null }))
-  if (u === null) return
-  const read = u.cache_read_input_tokens ?? 0
-  const total = (u.input_tokens ?? 0) + read + (u.cache_creation_input_tokens ?? 0)
-  if (total > 0) await update($, cache, () => ({ last: (read / total) * 100 }))
+  if (u !== null) {
+    const read = u.cache_read_input_tokens ?? 0
+    const total = (u.input_tokens ?? 0) + read + (u.cache_creation_input_tokens ?? 0)
+    if (total > 0) await update($, cache, () => ({ last: (read / total) * 100 }))
+  }
+  await syncStatus($)
 }
 
 // ---------- module ----------
@@ -165,6 +217,7 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)
+    shownStatus = null
     await update($, now, () => Date.now())
     await Promise.all([refreshInfo($), refreshUsage($)])
     lastGitAt = Date.now()
@@ -172,17 +225,32 @@ export const register: Register = on => {
     tick?.cancel()
     tick = $.clock.every(TICK_MS, () => {
       const t = Date.now()
-      void update($, now, () => t)
-      if (t - lastGitAt >= GIT_EVERY_MS) {
-        lastGitAt = t
-        void refreshInfo($)
-      }
+      const isGitDue = t - lastGitAt >= GIT_EVERY_MS
+      if (isGitDue) lastGitAt = t
+      void Promise.all([update($, now, () => t), isGitDue ? refreshInfo($) : null])
+        .then(() => syncStatus($))
+        .catch(() => {})
     })
+    await syncStatus($)
+    return result
+  })
+
+  // A client joining or leaving changes whether the status line belongs on screen.
+  on('session.attach', async ($, e, next) => {
+    const result = await next(e)
+    await syncStatus($)
+    return result
+  })
+
+  on('session.detach', async ($, e, next) => {
+    const result = await next(e)
+    await syncStatus($)
     return result
   })
 
   on('session.measure', async ($, e, next) => {
     await update($, usage, () => toUsage(e.context, e.rateLimits))
+    await syncStatus($)
     return next(e)
   })
 
@@ -191,6 +259,7 @@ export const register: Register = on => {
     if (e.agentId === undefined) {
       lastGitAt = Date.now()
       await refreshInfo($)
+      await syncStatus($)
     }
     return result
   })
@@ -200,6 +269,8 @@ export const register: Register = on => {
     if (/\bgit\b|\bcd\b/.test(e.command)) {
       lastGitAt = Date.now()
       void refreshInfo($)
+        .then(() => syncStatus($))
+        .catch(() => {})
     }
     return ran
   })
@@ -239,18 +310,26 @@ export const register: Register = on => {
           const est = shown / ((t - tShown) / 1000)
           isLive = true
           await update($, speed, s => ({ ...s, live: est }))
+          await syncStatus($)
         }
       }
     } finally {
       // Interrupted (Esc) or ended without a stop: no estimate may outlive its stream.
-      if (isLive && !isStopped) await update($, speed, s => ({ ...s, live: null })).catch(() => {})
+      if (isLive && !isStopped) {
+        await update($, speed, s => ({ ...s, live: null }))
+          .then(() => syncStatus($))
+          .catch(() => {})
+      }
     }
   })
 
   // Drawn in the footer under the prompt, where a settings statusLine sits: the HUD
   // rows first, then the engine's own hint line (mode, pills) kept live beneath them.
+  // The desktop asks for this line in its cloud sessions alone, one line high; its
+  // HUD is the status line (syncStatus).
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
     const engineLine = await next(e)
+    if (e.surface !== 'terminal') return engineLine
     const [i, u, s, c, t] = await Promise.all([
       read($, info),
       read($, usage),

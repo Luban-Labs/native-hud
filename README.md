@@ -1,11 +1,19 @@
-# native-hud 0.1.0
+# native-hud 0.2.0
 
 用 Claude Code 自带的界面元素，在输入框下方显示模型、路径、git/worktree、上下文、5 小时与 7 天用量及重置倒计时、输出速度和缓存命中率。纯 mod：不向模型上下文写任何内容，不占 token。
+
+终端：
 
 ```text
   ⏵⏵ auto mode on (shift+tab to cycle)
   ◆ Opus 5.5 1M   ~/code/app   ⎇ main ●2 ↑1
   ctx ━━━━━━━━━━ 38% 380k/1M   5h ━━━━━━━━━━ 72% ↻ 2h13m   7d ━━━━━━━━━━ 9% ↻ 3d4h   ⚡ 53 tok/s   cache 90%
+```
+
+Claude 桌面 app（Code 标签页），一行纯文字的状态行：
+
+```text
+  5h 72% ↻2h13m · ctx 38% · ⚡ 53 tok/s · cache 90% · ⎇ main ●2 ↑1
 ```
 
 ## 安装
@@ -42,6 +50,13 @@ claude --plugin-dir /path/to/native-hud
 ## 显示位置
 
 HUD 画在输入框下方的提示行（`PromptHint`）里：原来的模式行（如 `auto mode on`）和它右侧的提示照常保留在第一行，HUD 的两行在它下面。mod 没有办法在 `statusLine` 那一格画图形，所以位置比 statusLine 低一行。
+
+桌面 app 只在云端会话里请求这一行，本机会话不请求，所以桌面 app 里 HUD 改走 mod 的状态行（`$.ui.status`）：一行纯文字，不着色，按重要程度从左往右排。
+
+- 不显示模型和路径（底栏和侧栏已有），也不显示 7d（桌面 app 自己能看到用量）。
+- 5h 只在账户有 5 小时限额时出现；不在 git 仓库里时不显示 git 段。
+- ctx 只给百分比，详细数字点底栏右侧的上下文圆环看。
+- 会话同时画在终端上时（例如终端会话开着远程控制），状态行不出现，以免和终端里的两行重复。
 
 ## 数据从哪来
 

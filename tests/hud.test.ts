@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { On, TurnStepChunk, TurnStepResult } from 'claude-code'
+import type { On, RenderSurface, SessionMeasureInput, TurnStepChunk, TurnStepResult } from 'claude-code'
 
 import { estTokens, fmtDur, fmtTokens, hitLevel, parseGit, prettyModel, shortPath } from '../hooks/register'
 
@@ -27,10 +27,28 @@ function usageOf(out: number, input: number, read: number, write: number) {
   return { input_tokens: input, output_tokens: out, cache_read_input_tokens: read, cache_creation_input_tokens: write, model: 'm' }
 }
 
-function engine(on: On, opts: { git: boolean }) {
+const FIVE_HOUR = { kind: 'five_hour', percentUsed: 72.5, resetsAt: RESET_5H } as const
+const SEVEN_DAY = { kind: 'seven_day', percentUsed: 9, resetsAt: RESET_7D } as const
+
+function engine(on: On, opts: { git: boolean; fiveHour?: boolean; surfaces?: readonly RenderSurface[] }) {
   const argvs: (readonly string[])[] = []
+  const statuses: (string | undefined)[] = []
   const clock = mock.clock(on, { now: Date.now() })
   on('ui.render', () => ({ type: 'engine', ref: 0 }))
+  on('ui.status', (_$, e) => {
+    statuses.push(e.text)
+    return { value: undefined }
+  })
+  const asked = { surfaces: 0 }
+  const roster = { surfaces: opts.surfaces ?? (['terminal'] as readonly RenderSurface[]) }
+  const repo = { dirty: 2 }
+  on('session.surfaces', () => {
+    asked.surfaces += 1
+    return { value: roster.surfaces }
+  })
+  on('session.attach', (_$, e) => ({ clientId: e.clientId }))
+  on('session.detach', (_$, e) => ({ clientId: e.clientId }))
+  on('turn.complete', (_$, e) => ({ text: e.answer }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.model', () => ({ value: 'claude-opus-5-5[1m]' }))
   on('session.cwd', () => ({ value: '/Users/me/code/app' }))
@@ -39,10 +57,7 @@ function engine(on: On, opts: { git: boolean }) {
     value: {
       startedAt: 0,
       context: { tokens: 380_000, window: 1_000_000, percent: 38 },
-      rateLimits: [
-        { kind: 'five_hour', percentUsed: 72.5, resetsAt: RESET_5H },
-        { kind: 'seven_day', percentUsed: 9, resetsAt: RESET_7D },
-      ],
+      rateLimits: opts.fiveHour === false ? [SEVEN_DAY] : [FIVE_HOUR, SEVEN_DAY],
     },
   }))
   on('process.run', (_$, e) => {
@@ -50,12 +65,13 @@ function engine(on: On, opts: { git: boolean }) {
     if (!opts.git) {
       return { value: { exitCode: 128, stdout: '', stderr: 'not a git repo', isStdoutTruncated: false, isStderrTruncated: false } }
     }
+    const changed = Array.from({ length: repo.dirty }, (_, k) => `? f${k}.ts\n`).join('')
     const stdout = e.argv.includes('status')
-      ? '# branch.oid abc\n# branch.head feat/hud\n# branch.ab +2 -0\n1 .M N... 100644 100644 100644 a b src/x.ts\n? new.ts\n'
+      ? `# branch.oid abc\n# branch.head feat/hud\n# branch.ab +2 -0\n${changed}`
       : '/Users/me/code/app/.git/worktrees/hud\n/Users/me/code/app/.git\n/Users/me/code/hud\n'
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
-  return { argvs, clock }
+  return { argvs, statuses, asked, roster, repo, clock }
 }
 
 // The model's side of one step: the chunks a script lays out, then its result.
@@ -112,21 +128,133 @@ describe('helpers', () => {
   })
 })
 
-test('band draws every segment, no separators, on terminal and desktop', async ($, on) => {
+test('terminal band draws every segment, no separators', async ($, on) => {
   engine(on, { git: true })
   await $.session.start(START)
-  for (const surface of ['terminal', 'desktop'] as const) {
-    const ui = await $.ui.mount({ plugin: 'native-hud', surface, ...BAND })
-    const all = (await ui.findAll({ type: 'Text' })).map(t => t.text).join(' ')
-    for (const part of ['Opus 5.5 1M', '~/code/app', '⎇ feat/hud', 'wt:hud', '●2', '38%', '380k/1M', '73%', '↻ 2h13m', '↻ 3d4h', '— tok/s', 'cache —']) {
-      expect(all).toContain(part)
-    }
-    expect(all).not.toContain('│')
-    const tree = await ui.drawn()
-    const kids = (tree as { children?: readonly unknown[] }).children ?? []
-    expect(kids[kids.length - 1]).toEqual({ type: 'engine', ref: 0 })
-    await ui.unmount()
+  const ui = await $.ui.mount({ plugin: 'native-hud', surface: 'terminal', ...BAND })
+  const all = (await ui.findAll({ type: 'Text' })).map(t => t.text).join(' ')
+  for (const part of ['Opus 5.5 1M', '~/code/app', '⎇ feat/hud', 'wt:hud', '●2', '38%', '380k/1M', '73%', '↻ 2h13m', '↻ 3d4h', '— tok/s', 'cache —']) {
+    expect(all).toContain(part)
   }
+  expect(all).not.toContain('│')
+  const tree = await ui.drawn()
+  const kids = (tree as { children?: readonly unknown[] }).children ?? []
+  expect(kids[kids.length - 1]).toEqual({ type: 'engine', ref: 0 })
+  await ui.unmount()
+})
+
+test('terminal band keeps 5h as a dash on an account without that limit', async ($, on) => {
+  engine(on, { git: true, fiveHour: false })
+  await $.session.start(START)
+  const all = await band($)
+  expect(all).toMatch(/5h — /)
+  expect(all).toContain('↻ 3d4h')
+})
+
+const DESKTOP = { surfaces: ['desktop'] } as const
+
+test('a desktop session gets one status line, pushed once at start', async ($, on) => {
+  const { statuses } = engine(on, { git: true, ...DESKTOP })
+  await $.session.start(START)
+  expect(statuses).toEqual(['5h 73% ↻2h13m · ctx 38% · ⚡ — tok/s · cache — · ⎇ feat/hud wt:hud ●2 ↑2'])
+  await $.session.start(START)
+  expect(statuses).toHaveLength(2)
+})
+
+test('the desktop status line comes and goes with the desktop client', async ($, on) => {
+  const { statuses, roster } = engine(on, { git: true, surfaces: [] })
+  await $.session.start(START)
+  expect(statuses).toEqual([undefined])
+  roster.surfaces = ['desktop']
+  await $.session.attach({ surface: 'desktop', clientId: 'desktop:default' })
+  expect(statuses.at(-1)).toMatch(/^5h 73% /)
+  roster.surfaces = []
+  await $.session.detach({ surface: 'desktop', clientId: 'desktop:default', reason: 'detach' })
+  expect(statuses.at(-1)).toBe(undefined)
+})
+
+test('the desktop status line picks up git after a turn', async ($, on) => {
+  const { statuses, repo } = engine(on, { git: true, ...DESKTOP })
+  await $.session.start(START)
+  expect(statuses.at(-1)).toMatch(/ ●2 ↑2$/)
+  repo.dirty = 5
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  expect(statuses.at(-1)).toMatch(/ ●5 ↑2$/)
+})
+
+test('the desktop status line shows the live estimate and drops it when the stream is cut', async ($, on) => {
+  const { statuses } = engine(on, { git: true, ...DESKTOP })
+  model(on, function* () {
+    for (let i = 0; i < 60; i += 1) {
+      busy(20)
+      yield { kind: 'text', index: 0, text: '流式输出' }
+    }
+    yield 'end'
+  })
+  await $.session.start(START)
+  let n = 0
+  for await (const _ of $.turn.step(STEP)) {
+    n += 1
+    if (n === 49) break
+  }
+  expect(statuses.some(t => /⚡ ~\d+ tok\/s/.test(t ?? ''))).toBe(true)
+  expect(statuses.at(-1)).toContain('⚡ — tok/s')
+})
+
+test('the desktop status line leaves out 5h without that limit and git outside a repository', async ($, on) => {
+  const { statuses } = engine(on, { git: false, fiveHour: false, ...DESKTOP })
+  await $.session.start(START)
+  expect(statuses.at(-1)).toBe('ctx 38% · ⚡ — tok/s · cache —')
+})
+
+test('the desktop status line follows usage, speed and cache, and skips a repeat', async ($, on) => {
+  const { statuses } = engine(on, { git: true, ...DESKTOP })
+  model(on, function* () {
+    yield { kind: 'text', index: 0, text: 'ok' }
+    busy(300)
+    yield { kind: 'stop', stopReason: 'end_turn', usage: usageOf(60, 50, 900, 50) }
+  })
+  on('session.measure', (_$, e) => ({ changed: e.changed }))
+  await $.session.start(START)
+  const measure: SessionMeasureInput = {
+    context: { tokens: 900_000, window: 1_000_000, percent: 90 },
+    rateLimits: [{ kind: 'five_hour', percentUsed: 12, resetsAt: RESET_5H }],
+    changed: ['context', 'rateLimits'],
+  }
+  await $.session.measure(measure)
+  expect(statuses.at(-1)).toMatch(/^5h 12% ↻2h13m · ctx 90% · /)
+  const pushed = statuses.length
+  await $.session.measure(measure)
+  expect(statuses.length).toBe(pushed)
+  await drain($)
+  expect(statuses.at(-1)).toMatch(/ · ⚡ \d+ tok\/s · cache 90% · /)
+})
+
+// The countdown reads real time, which the mocked clock does not move: what a test
+// can hold is that each tick works the line out again.
+test('each tick works the desktop status line out again, for the reset countdown', async ($, on) => {
+  const { asked, clock } = engine(on, { git: true, ...DESKTOP })
+  await $.session.start(START)
+  asked.surfaces = 0
+  await clock.advance(15_000)
+  expect(asked.surfaces).toBe(1)
+})
+
+for (const surfaces of [['terminal'], ['terminal', 'mobile'], ['terminal', 'desktop']] as const) {
+  test(`no status line where a terminal draws (${surfaces.join(', ')})`, async ($, on) => {
+    const { statuses } = engine(on, { git: true, surfaces })
+    await $.session.start(START)
+    expect(statuses.length).toBeGreaterThan(0)
+    expect(statuses.every(t => t === undefined)).toBe(true)
+  })
+}
+
+test('the desktop PromptHint is the engine line alone', async ($, on) => {
+  engine(on, { git: true, ...DESKTOP })
+  await $.session.start(START)
+  const ui = await $.ui.mount({ plugin: 'native-hud', surface: 'desktop', ...BAND })
+  expect(await ui.drawn()).toEqual({ type: 'engine', ref: 0 })
+  await ui.unmount()
 })
 
 test('git status never takes optional locks', async ($, on) => {
